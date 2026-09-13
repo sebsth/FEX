@@ -262,7 +262,9 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
           {
 
             .flags = flags & ~CSIGNAL, // This no longer contains CSIGNAL
-            .pidfd = 0,                // For clone, pidfd is duplicated here
+            // Legacy clone() aliases the CLONE_PIDFD output pointer with the
+            // parent_tid argument. Preserve it separately for ForkGuest().
+            .pidfd = reinterpret_cast<uint64_t>(parent_tid),
             .child_tid = reinterpret_cast<uint64_t>(child_tid),
             .parent_tid = reinterpret_cast<uint64_t>(parent_tid),
             .exit_signal = flags & CSIGNAL,

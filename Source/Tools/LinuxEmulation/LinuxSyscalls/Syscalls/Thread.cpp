@@ -363,6 +363,23 @@ uint64_t ForkGuest(FEXCore::Core::InternalThreadState* Thread, FEXCore::Core::Cp
       if (flags & CLONE_PARENT_SETTID) {
         *parent_tid = Result;
       }
+
+      // CloneFork() strips CLONE_PIDFD from the host clone operation.
+      // Once the host child PID is known, obtain a pidfd for that child
+      // and return it through the guest-supplied pidfd pointer.
+      if (flags & CLONE_PIDFD) {
+        const int pidfd = ::syscall(SYSCALL_DEF(pidfd_open), Result, 0);
+
+        if (pidfd == -1) {
+          LogMan::Msg::EFmt(
+            "Couldn't get pidfd of PID {}. errno={}\n",
+            Result,
+            errno);
+        } else {
+          *reinterpret_cast<int*>(args->args.pidfd) = pidfd;
+        }
+      }
+
     }
 
     // Unlock the mutexes on both sides of the fork
@@ -445,6 +462,7 @@ void RegisterThread(FEX::HLE::SyscallHandler* Handler) {
                           FEX::HLE::clone3_args args {};
                           args.Type = TypeOfClone::TYPE_CLONE3;
                           memcpy(&args.args, cl_args, std::min(sizeof(FEX::HLE::kernel_clone3_args), size));
+
                           return CloneHandler(Frame, &args);
                         }));
 
