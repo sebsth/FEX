@@ -269,37 +269,11 @@ namespace DiskCache {
     }
   }
 
-  bool IndexedDB::StoreCacheBlob(const MesaFOZ::foz_payload_key& UniqueKey, uint64_t LookupKey, std::span<const uint8_t> Blob, Index& Index,
-                                 std::mutex& IndexMutex, std::span<const uint8_t> IndexBlob) {
+  bool IndexedDB::StoreCacheBlob(const MesaFOZ::foz_payload_key& UniqueKey, uint64_t LookupKey, std::span<const uint8_t> Blob,
+                                 MesaFOZ::mesa_index_db_file_entry& IndexEntry, std::span<const uint8_t> IndexBlob) {
     if (ReadOnly) {
       // shouldn't happen
       return false;
-    }
-
-    {
-      std::lock_guard Guard(IndexMutex);
-      auto IndexIt = Index.find(LookupKey);
-      bool Dupe = false;
-      if (IndexIt != Index.end()) {
-        if (IndexIt->second.MoreEntries.get()) {
-          for (auto& [Key, Elem] : *IndexIt->second.MoreEntries) {
-            if (XXH128_isEqual(Elem.GuestHash, *(const XXH128_hash_t*)(IndexBlob.data()))) {
-              Dupe = true;
-              break;
-            }
-          }
-        }
-        if (!Dupe && XXH128_isEqual(IndexIt->second.MainEntry.GuestHash, *(const XXH128_hash_t*)(IndexBlob.data()))) {
-          Dupe = true;
-        }
-        // could happen if it's seen again while in flight in the store queue
-        if (Dupe) {
-          return true;
-        }
-        if (IndexIt->second.MoreEntries.get() && IndexIt->second.MoreEntries->size() >= LOOKUP_KEY_MAX_BUCKET_DEPTH) {
-          return true;
-        }
-      }
     }
 
     if (!CacheFOZ.Lock(STORE_LOCK_TIMEOUT_MS) || !IndexFOZ.Lock(STORE_LOCK_TIMEOUT_MS)) {
@@ -317,10 +291,10 @@ namespace DiskCache {
       return false;
     }
 
-    MesaFOZ::mesa_index_db_file_entry IndexEntry {.hash = LookupKey,
-                                                  .size = (uint32_t)Blob.size(),
-                                                  .last_access_time = 0, // todo..
-                                                  .cache_db_file_offset = BlobOffset};
+    IndexEntry = {.hash = LookupKey,
+                  .size = (uint32_t)Blob.size(),
+                  .last_access_time = 0, // todo..
+                  .cache_db_file_offset = BlobOffset};
 
     std::span<const uint8_t> IndexBlobChunks[] = {
       {(const uint8_t*)&IndexEntry, sizeof(IndexEntry)},
@@ -341,22 +315,6 @@ namespace DiskCache {
       CacheFileSize = BlobOffset + Blob.size();
     }
 
-    const IndexExtraBlobHeader* IndexBlobHeader = reinterpret_cast<const IndexExtraBlobHeader*>(IndexBlob.data());
-
-    struct IndexEntry NewEntry {this, BlobOffset, (uint32_t)Blob.size(), IndexBlobHeader->GuestSize, IndexBlobHeader->GuestHash};
-    NewEntry.GuestExtents.resize(IndexBlobHeader->GuestExtentsCount);
-    memcpy(NewEntry.GuestExtents.data(), reinterpret_cast<const uint32_t*>(IndexBlob.data() + sizeof(IndexExtraBlobHeader)),
-           IndexBlobHeader->GuestExtentsCount * sizeof(uint32_t));
-    std::lock_guard Guard(IndexMutex);
-    auto It = Index.find(LookupKey);
-    if (It == Index.end()) {
-      Index.emplace(LookupKey, IndexCacheHead {std::move(NewEntry), IndexBlobHeader->GuestFootprint, nullptr});
-    } else {
-      if (!It->second.MoreEntries.get()) {
-        It->second.MoreEntries = fextl::make_unique<fextl::multimap<uint64_t, struct IndexEntry>>();
-      }
-      It->second.MoreEntries->insert({IndexBlobHeader->GuestFootprint, std::move(NewEntry)});
-    }
     return true;
   }
 
@@ -433,7 +391,8 @@ namespace DiskCache {
       MesaFOZ::foz_payload_key MetadataKey;
       memset(MetadataKey.bytes, 0xFF, sizeof(MetadataKey));
       IndexExtraBlobHeader MetaDataHeader = {};
-      RWCacheDB->StoreCacheBlob(MetadataKey, ~0, {BucketBytes.data(), BucketBytes.size()}, Index, IndexLock,
+      MesaFOZ::mesa_index_db_file_entry IndexEntry = {};
+      RWCacheDB->StoreCacheBlob(MetadataKey, ~0, {BucketBytes.data(), BucketBytes.size()}, IndexEntry,
                                 {reinterpret_cast<uint8_t*>(&MetaDataHeader), sizeof(MetaDataHeader)});
       Index.erase(~0);
     }
@@ -459,7 +418,7 @@ namespace DiskCache {
 
     if (IsWritingDiskCache()) {
       FEXCore::Threads::Flags WriterThreadFlags = {.LowPriority = true, .Internal = true};
-      Writer = fextl::make_unique<WorkQueueThread>(WriterThreadFlags);
+      Writer = fextl::make_unique<WorkQueueThread>(WriterThreadFlags, "FEX:DiskCache");
     }
   }
 
@@ -485,6 +444,49 @@ namespace DiskCache {
 
     return XXH3_64bits(&BlobKeyBytes, sizeof(BlobKeyBytes));
   }
+
+  struct DiskCache::PruneMemoryLRUWorkItem final : WorkQueueThread::WorkItem {
+    DiskCache* Self;
+    PruneMemoryLRUWorkItem(DiskCache* Self)
+      : Self(Self) {}
+    void Run() override {
+      if (Self->MemoryLRUCurrentSize <= Self->MemoryLRUMaxSize + Self->MemoryLRUEvictThreshold) {
+        return;
+      }
+      std::lock_guard IndexGuard(Self->IndexLock);
+      std::lock_guard LRUGuard(Self->MemoryLRULock);
+      if (Self->MemoryLRU.empty()) {
+        return;
+      }
+      auto Last = std::prev(Self->MemoryLRU.end());
+
+      while (Self->MemoryLRUCurrentSize > Self->MemoryLRUMaxSize && !Self->MemoryLRU.empty()) {
+        auto LastKey = *Last;
+        auto IndexEntry = Self->LookupLocked(LastKey.LookupKey, LastKey.GuestHash, LastKey.GuestFootprint);
+        bool AtFront = (Last == Self->MemoryLRU.begin());
+        if (IndexEntry && IndexEntry->MemoryBlob.use_count() > 1) {
+          // being read rn, keep moving
+          if (AtFront) {
+            break;
+          }
+          Last--;
+          continue;
+        }
+        if (IndexEntry) {
+          IndexEntry->MemoryBlob.reset();
+          IndexEntry->LRUEntry.reset();
+        }
+        Self->MemoryLRUCurrentSize -= LastKey.Size;
+        auto Deleted = Last;
+        if (AtFront) {
+          Self->MemoryLRU.erase(Deleted);
+          break;
+        }
+        Last--;
+        Self->MemoryLRU.erase(Deleted);
+      }
+    }
+  };
 
   std::optional<CodeHitData> DiskCache::Lookup(Core::InternalThreadState* Thread, std::optional<ExecutableFileSectionInfo> Region,
                                                uint64_t GuestRIP, std::optional<uint64_t>& GuestCodeKey) {
@@ -546,6 +548,8 @@ namespace DiskCache {
     fextl::multimap<uint64_t, IndexEntry>::iterator MoreEntriesIt;
     fextl::multimap<uint64_t, IndexEntry>* MapPointer = nullptr;
     IndexEntry* EntryUnderReview;
+    fextl::shared_ptr<fextl::vector<uint8_t>> BlobRef;
+    std::optional<fextl::list<MemoryLRUKey>::iterator> LRUIter;
     uint64_t CurrentFootprint = 0;
     {
       std::lock_guard Guard(IndexLock);
@@ -563,9 +567,13 @@ namespace DiskCache {
       }
       if (MapPointer && MoreEntriesIt != It->second.MoreEntries->end()) {
         EntryUnderReview = &MoreEntriesIt->second;
+        BlobRef = EntryUnderReview->MemoryBlob;
+        LRUIter = EntryUnderReview->LRUEntry;
         CurrentFootprint = MoreEntriesIt->first;
       } else {
         EntryUnderReview = &MainEntry;
+        BlobRef = EntryUnderReview->MemoryBlob;
+        LRUIter = EntryUnderReview->LRUEntry;
         CurrentFootprint = MainEntryFootprint;
         TriedMainEntry = true;
       }
@@ -582,6 +590,8 @@ namespace DiskCache {
           // if the current footprint is also the main entry's footprint, give main entry a shot next
           if (!TriedMainEntry && MoreEntriesIt->first == MainEntryFootprint) {
             EntryUnderReview = &MainEntry;
+            BlobRef = EntryUnderReview->MemoryBlob;
+            LRUIter = EntryUnderReview->LRUEntry;
             CurrentFootprint = MainEntryFootprint;
             TriedMainEntry = true;
           } else {
@@ -594,12 +604,16 @@ namespace DiskCache {
             break;
           } else {
             EntryUnderReview = &MainEntry;
+            BlobRef = EntryUnderReview->MemoryBlob;
+            LRUIter = EntryUnderReview->LRUEntry;
             CurrentFootprint = MainEntryFootprint;
             TriedMainEntry = true;
           }
         }
         if (!EntryUnderReview && MapPointer && MoreEntriesIt != MapPointer->end()) {
           EntryUnderReview = &MoreEntriesIt->second;
+          BlobRef = EntryUnderReview->MemoryBlob;
+          LRUIter = EntryUnderReview->LRUEntry;
           CurrentFootprint = MoreEntriesIt->first;
         }
       }
@@ -699,7 +713,17 @@ namespace DiskCache {
     HitData.Blob.resize(GuestPages.size() * sizeof(uint64_t) + EntrySizeWithoutGuestCode);
     memcpy(HitData.Blob.data(), GuestPages.data(), GuestPages.size() * sizeof(uint64_t));
     uint32_t BlobOffset = GuestPages.size() * sizeof(uint64_t);
-    if (!Entry.DB->ReadCacheBlob(Entry.Offset, {HitData.Blob.data() + BlobOffset, EntrySizeWithoutGuestCode})) {
+    bool FoundInLRU = false;
+    if (BlobRef && BlobRef->size() >= EntrySizeWithoutGuestCode) {
+      FoundInLRU = true;
+      memcpy(HitData.Blob.data() + BlobOffset, BlobRef->data(), EntrySizeWithoutGuestCode);
+      if (LRUIter) {
+        std::lock_guard Guard(MemoryLRULock);
+        // avoided disk by nabbing from lru, bump to front
+        // LogMan::Msg::IFmt("lru hit! {}", MemoryLRUCurrentSize);
+        MemoryLRU.splice(MemoryLRU.begin(), MemoryLRU, *LRUIter);
+      }
+    } else if (!Entry.DB->ReadCacheBlob(Entry.Offset, {HitData.Blob.data() + BlobOffset, EntrySizeWithoutGuestCode})) {
       return std::nullopt;
     }
 
@@ -718,6 +742,29 @@ namespace DiskCache {
 
     if (Entry.GuestSize != Header.GuestSize || !XXH128_isEqual(Header.GuestHash, Entry.GuestHash)) {
       return std::nullopt;
+    }
+
+    bool StoreInMemory = !FoundInLRU;
+    if (EntrySizeWithoutGuestCode > MemoryLRUMaxSize) {
+      StoreInMemory = false;
+    }
+
+    if (StoreInMemory) {
+      auto NewBlobRef = fextl::make_shared<fextl::vector<uint8_t>>(EntrySizeWithoutGuestCode);
+      memcpy(NewBlobRef->data(), HitData.Blob.data() + BlobOffset, EntrySizeWithoutGuestCode);
+      std::lock_guard Guard(IndexLock);
+      auto CurrentIndexEntry = LookupLocked(LookupKey, Header.GuestHash, LastFootprintHashed);
+      if (CurrentIndexEntry && !CurrentIndexEntry->MemoryBlob) {
+        std::lock_guard LRUGuard(MemoryLRULock);
+        MemoryLRU.push_front({LookupKey, Header.GuestHash, LastFootprintHashed, EntrySizeWithoutGuestCode});
+        CurrentIndexEntry->LRUEntry = MemoryLRU.begin();
+        CurrentIndexEntry->MemoryBlob = NewBlobRef;
+        MemoryLRUCurrentSize += EntrySizeWithoutGuestCode;
+      }
+    }
+
+    if (StoreInMemory && MemoryLRUCurrentSize > MemoryLRUMaxSize + MemoryLRUEvictThreshold) {
+      Writer->QueueWork(fextl::make_unique<PruneMemoryLRUWorkItem>(this));
     }
 
     HitData.HostCode = {HitData.Blob.data() + BlobOffset, Header.HostSize};
@@ -785,23 +832,79 @@ namespace DiskCache {
     }
   }
 
+  IndexEntry* DiskCache::LookupLocked(const uint64_t LookupKey, const XXH128_hash_t& GuestHash, const uint64_t GuestFootprint) {
+    auto It = Index.find(LookupKey);
+    if (It != Index.end()) {
+      if (XXH128_isEqual(It->second.MainEntry.GuestHash, GuestHash)) {
+        return &It->second.MainEntry;
+      }
+      if (It->second.MoreEntries.get()) {
+        auto Range = It->second.MoreEntries->equal_range(GuestFootprint);
+        for (auto MoreEntriesIt = Range.first; MoreEntriesIt != Range.second; MoreEntriesIt++) {
+          if (XXH128_isEqual(MoreEntriesIt->second.GuestHash, GuestHash)) {
+            return &MoreEntriesIt->second;
+          }
+        }
+      }
+    }
+    return nullptr;
+  }
+
   struct DiskCache::CacheStoreWorkItem final : WorkQueueThread::WorkItem {
     DiskCache* Self;
     IndexedDB* DB;
     MesaFOZ::foz_payload_key UniqueKey;
     uint64_t LookupKey;
-    fextl::vector<uint8_t> Blob;
+    std::span<uint8_t> Blob;
     fextl::vector<uint8_t> IndexBlob;
     CacheStoreWorkItem(DiskCache* Self, IndexedDB* DB, const MesaFOZ::foz_payload_key& UniqueKey, uint64_t LookupKey,
-                       fextl::vector<uint8_t>&& Blob, fextl::vector<uint8_t>&& IndexBlob)
+                       std::span<uint8_t> Blob, fextl::vector<uint8_t>&& IndexBlob)
       : Self(Self)
       , DB(DB)
       , UniqueKey(UniqueKey)
       , LookupKey(LookupKey)
-      , Blob(std::move(Blob))
+      , Blob(Blob)
       , IndexBlob(std::move(IndexBlob)) {}
     void Run() override {
-      DB->StoreCacheBlob(UniqueKey, LookupKey, Blob, Self->Index, Self->IndexLock, IndexBlob);
+      struct MesaFOZ::mesa_index_db_file_entry IndexHeader;
+      bool Success = DB->StoreCacheBlob(UniqueKey, LookupKey, Blob, IndexHeader, IndexBlob);
+
+      if (Success) {
+        bool KeepEntryInMemory = true;
+        // todo possible other lru condition here like entry size?
+        if (Blob.size() > Self->MemoryLRUMaxSize) {
+          KeepEntryInMemory = false;
+        } else {
+          Self->MemoryLRUCurrentSize += Blob.size();
+        }
+
+        const IndexExtraBlobHeader* IndexAfterHeader = reinterpret_cast<const IndexExtraBlobHeader*>(IndexBlob.data());
+
+        fextl::list<MemoryLRUKey>::iterator NewLRUEntry;
+        if (KeepEntryInMemory) {
+          std::lock_guard Guard(Self->MemoryLRULock);
+          Self->MemoryLRU.push_front({LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint, (uint32_t)Blob.size()});
+          NewLRUEntry = Self->MemoryLRU.begin();
+        }
+        {
+          std::lock_guard Guard(Self->IndexLock);
+          auto IndexEntry = Self->LookupLocked(LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint);
+          LOGMAN_THROW_A_FMT(IndexEntry != nullptr, "Stored Index entry not found?");
+          if (IndexEntry) {
+            IndexEntry->DB = DB;
+            IndexEntry->Offset = IndexHeader.cache_db_file_offset;
+            if (!KeepEntryInMemory) {
+              IndexEntry->MemoryBlob.reset();
+            } else {
+              IndexEntry->LRUEntry = NewLRUEntry;
+            }
+          }
+        }
+
+        if (KeepEntryInMemory && Self->MemoryLRUCurrentSize > Self->MemoryLRUMaxSize + Self->MemoryLRUEvictThreshold) {
+          Self->Writer->QueueWork(fextl::make_unique<PruneMemoryLRUWorkItem>(Self));
+        }
+      }
     }
   };
 
@@ -825,6 +928,11 @@ namespace DiskCache {
         if (Target >= Region->BeginVA && Target < Region->EndVA) {
           continue;
         }
+        // let it through if it's inside the same ELF image? (like bss)
+        if (Region->FileInfo.MappedSize && Target >= Region->FileStartVA && Target < Region->FileStartVA + Region->FileInfo.MappedSize) {
+          continue;
+        }
+
         auto TargetSection = CTX->SyscallHandler->LookupExecutableFileSection(Thread, Target);
         if (!TargetSection || TargetSection->FileInfo.FileId != Region->FileInfo.FileId) {
           // we don't know where it's pointing, so we don't know how to encode the offset, so we can't cache atm
@@ -842,61 +950,6 @@ namespace DiskCache {
         SmallRelocCount++;
       }
     }
-
-    fextl::set<uint64_t> DataMaskAddresses;
-
-    fextl::vector<uint32_t> ExactGuestCodeExtents;
-    uint64_t CurStartExtent = 0, CurEndExtent = 0;
-    const Frontend::Decoder::DecodedBlocks* LastBlock = nullptr;
-    for (auto& SubBlock : DecodedBlockInfo->Blocks) {
-      if (SubBlock.BlockStatus != Frontend::Decoder::DecodedBlockStatus::SUCCESS) {
-        return false;
-      }
-      if (!CurStartExtent) {
-        CurStartExtent = SubBlock.Entry;
-        CurEndExtent = SubBlock.Entry + SubBlock.Size;
-      } else {
-        LOGMAN_THROW_A_FMT(SubBlock.Entry >= CurEndExtent, "DecodedBlocks not sorted or overlapping?");
-        if (SubBlock.Entry == CurEndExtent) {
-          CurEndExtent = SubBlock.Entry + SubBlock.Size;
-        } else {
-          ExactGuestCodeExtents.push_back(CurStartExtent - GuestRIP);
-          ExactGuestCodeExtents.push_back(CurEndExtent - CurStartExtent);
-          CurStartExtent = SubBlock.Entry;
-          CurEndExtent = SubBlock.Entry + SubBlock.Size;
-        }
-      }
-      // split extents according to data masks as well
-      for (auto& Mask : SubBlock.DataMasks) {
-        if (Mask.FieldAddress > CurStartExtent) {
-          ExactGuestCodeExtents.push_back(CurStartExtent - GuestRIP);
-          ExactGuestCodeExtents.push_back(Mask.FieldAddress - CurStartExtent);
-        }
-        CurStartExtent = Mask.FieldAddress + Mask.ValueSize;
-
-        DataMaskAddresses.insert(Mask.FieldAddress);
-      }
-      LastBlock = &SubBlock;
-    }
-    if (LastBlock && (CurStartExtent != GuestRIP || CurEndExtent != GuestRIP + GuestCode.size())) {
-      ExactGuestCodeExtents.push_back(CurStartExtent - GuestRIP);
-      ExactGuestCodeExtents.push_back(CurEndExtent - CurStartExtent);
-    }
-
-    if (ExactGuestCodeExtents.size() == 0) {
-      ExactGuestCodeExtents.reserve(2);
-      ExactGuestCodeExtents.push_back(0);
-      ExactGuestCodeExtents.push_back(GuestCode.size());
-    }
-
-    uint64_t GuestFootprint = XXH3_64bits(ExactGuestCodeExtents.data(), ExactGuestCodeExtents.size() * sizeof(uint32_t));
-
-    // if (ExactGuestCodeExtents.size()) {
-    //   LogMan::Msg::IFmt("store! length {:d}", GuestCode.size());
-    //   for(uint32_t i = 0; i < ExactGuestCodeExtents.size(); i+=2 ) {
-    //     LogMan::Msg::IFmt("extent {} {}", ExactGuestCodeExtents[i], ExactGuestCodeExtents[i]+ExactGuestCodeExtents[i+1]);
-    //   }
-    // }
 
     const uint32_t EntryPointCount = (uint32_t)CompiledCode.EntryPoints.size();
 
@@ -922,15 +975,6 @@ namespace DiskCache {
       .ThunkRelocCount = ThunkRelocCount,
     };
 
-    {
-      XXH3_state_t HashState;
-      XXH3_128bits_reset(&HashState);
-      for (uint32_t i = 0; i < ExactGuestCodeExtents.size(); i += 2) {
-        XXH3_128bits_update(&HashState, GuestCode.data() + ExactGuestCodeExtents[i], ExactGuestCodeExtents[i + 1]);
-      }
-      Header.GuestHash = XXH3_128bits_digest(&HashState);
-    }
-    memcpy(BlobData + HeaderOffset, &Header, sizeof(Header));
     memcpy(BlobData + HostCodeOffset, CompiledCode.BlockBegin, CompiledCode.Size);
 
     // pack and relocate entrypoints
@@ -942,6 +986,8 @@ namespace DiskCache {
       EntryHostOffsets[EntryIdx] = uint32_t(HostAddr - CompiledCode.BlockBegin);
       EntryIdx++;
     }
+
+    fextl::set<uint64_t> DataMasksConsumed;
 
     // pack relocations
     auto* SmallRelocs = reinterpret_cast<BlobSmallRelocation*>(BlobData + SmallRelocsOffset);
@@ -979,7 +1025,8 @@ namespace DiskCache {
       }
       case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_DATA_MOVE:
       case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_MOVE:
-      case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL: {
+      case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_RIP_LITERAL:
+      case CPU::RelocationTypes::RELOC_GUEST_PATCHABLE_CRC_MOVE: {
         // same data for all, relative vs. not and register vs. literal will depend on type on apply
         BlobSmallRelocation SmallReloc = {};
         SmallReloc.Offset = Reloc.Header.Offset;
@@ -989,12 +1036,8 @@ namespace DiskCache {
         SmallReloc.PatchableData.SiteOffset = uint32_t(Reloc.GuestPatchableData.SiteAddress - GuestRIP);
         SmallRelocs[SmallIdx++] = SmallReloc;
 
-        // mark the corresponding data mask consumed - we might not find one if they got removed due to the smc workaround
-        // the hash will just fail on lookup later
-        auto It = DataMaskAddresses.find(Reloc.GuestPatchableData.SiteAddress);
-        if (It != DataMaskAddresses.end()) {
-          DataMaskAddresses.erase(It);
-        }
+        // mark the corresponding data mask consumed
+        DataMasksConsumed.insert(Reloc.GuestPatchableData.SiteAddress);
 
         break;
       }
@@ -1009,17 +1052,108 @@ namespace DiskCache {
       }
     }
 
-    if (!DataMaskAddresses.empty()) {
-      LogMan::Msg::IFmt("DiskCache: DataMask unaccounted for! {:x}", GuestCodeKey);
-      // this would mean we omitted contents in the hash that we're not going to patch, which would be loading corrupt code
-      return false;
+    fextl::vector<uint32_t> ExactGuestCodeExtents;
+    uint64_t CurStartExtent = 0, CurEndExtent = 0;
+    const Frontend::Decoder::DecodedBlocks* LastBlock = nullptr;
+    for (auto& SubBlock : DecodedBlockInfo->Blocks) {
+      if (SubBlock.BlockStatus != Frontend::Decoder::DecodedBlockStatus::SUCCESS) {
+        return false;
+      }
+      if (!CurStartExtent) {
+        CurStartExtent = SubBlock.Entry;
+        CurEndExtent = SubBlock.Entry + SubBlock.Size;
+      } else {
+        LOGMAN_THROW_A_FMT(SubBlock.Entry >= CurEndExtent, "DecodedBlocks not sorted or overlapping?");
+        if (SubBlock.Entry == CurEndExtent) {
+          CurEndExtent = SubBlock.Entry + SubBlock.Size;
+        } else {
+          ExactGuestCodeExtents.push_back(CurStartExtent - GuestRIP);
+          ExactGuestCodeExtents.push_back(CurEndExtent - CurStartExtent);
+          CurStartExtent = SubBlock.Entry;
+          CurEndExtent = SubBlock.Entry + SubBlock.Size;
+        }
+      }
+      // split extents according to data masks as well
+      for (auto& Mask : SubBlock.DataMasks) {
+        if (Mask.Type == Frontend::Decoder::DataMaskType::NOP || DataMasksConsumed.find(Mask.FieldAddress) != DataMasksConsumed.end()) {
+          if (Mask.FieldAddress > CurStartExtent) {
+            ExactGuestCodeExtents.push_back(CurStartExtent - GuestRIP);
+            ExactGuestCodeExtents.push_back(Mask.FieldAddress - CurStartExtent);
+          }
+          CurStartExtent = Mask.FieldAddress + Mask.ValueSize;
+        }
+      }
+      LastBlock = &SubBlock;
+    }
+    if (LastBlock && (CurStartExtent != GuestRIP || CurEndExtent != GuestRIP + GuestCode.size())) {
+      ExactGuestCodeExtents.push_back(CurStartExtent - GuestRIP);
+      ExactGuestCodeExtents.push_back(CurEndExtent - CurStartExtent);
     }
 
-    memcpy(BlobData + GuestCodeOffset, GuestCode.data(), GuestCode.size());
+    if (ExactGuestCodeExtents.size() == 0) {
+      ExactGuestCodeExtents.reserve(2);
+      ExactGuestCodeExtents.push_back(0);
+      ExactGuestCodeExtents.push_back(GuestCode.size());
+    }
+
+    uint64_t GuestFootprint = XXH3_64bits(ExactGuestCodeExtents.data(), ExactGuestCodeExtents.size() * sizeof(uint32_t));
+
+    // if (ExactGuestCodeExtents.size()) {
+    //   LogMan::Msg::IFmt("store! length {:d}", GuestCode.size());
+    //   for(uint32_t i = 0; i < ExactGuestCodeExtents.size(); i+=2 ) {
+    //     LogMan::Msg::IFmt("extent {} {}", ExactGuestCodeExtents[i], ExactGuestCodeExtents[i]+ExactGuestCodeExtents[i+1]);
+    //   }
+    // }
+    {
+      XXH3_state_t HashState;
+      XXH3_128bits_reset(&HashState);
+      for (uint32_t i = 0; i < ExactGuestCodeExtents.size(); i += 2) {
+        XXH3_128bits_update(&HashState, GuestCode.data() + ExactGuestCodeExtents[i], ExactGuestCodeExtents[i + 1]);
+      }
+      Header.GuestHash = XXH3_128bits_digest(&HashState);
+    }
+    memcpy(BlobData + HeaderOffset, &Header, sizeof(Header));
 
     auto RangeInfo = CTX->SyscallHandler->QueryGuestExecutableRange(Thread, GuestRIP);
     uint64_t LookupKey =
       MakeLookupKey(Thread, GuestCodeKey, RangeInfo.Writable, GuestRIP == CTX->GetMonoBackPatcherBlock().load(std::memory_order_relaxed));
+
+    // blob done, publish to index as in-memory for now, flush to disk below
+    auto BlobRef = fextl::make_shared<fextl::vector<uint8_t>>(std::move(Blob));
+    struct IndexEntry NewEntry {nullptr, 0, (uint32_t)TotalSize, Header.GuestSize, Header.GuestHash, BlobRef};
+    NewEntry.GuestExtents = ExactGuestCodeExtents;
+    {
+      std::lock_guard Guard(IndexLock);
+      auto It = Index.find(LookupKey);
+      if (It == Index.end()) {
+        Index.emplace(LookupKey, IndexCacheHead {std::move(NewEntry), GuestFootprint, nullptr});
+      } else {
+        bool Dupe = false;
+        if (It->second.MoreEntries.get()) {
+          for (auto& [Key, Elem] : *It->second.MoreEntries) {
+            if (XXH128_isEqual(Elem.GuestHash, Header.GuestHash)) {
+              Dupe = true;
+              break;
+            }
+          }
+        }
+        if (!Dupe && XXH128_isEqual(It->second.MainEntry.GuestHash, Header.GuestHash)) {
+          Dupe = true;
+        }
+        // could happen if it's seen again while in flight in the store queue
+        if (Dupe) {
+          return true;
+        }
+        if (!It->second.MoreEntries.get()) {
+          It->second.MoreEntries = fextl::make_unique<fextl::multimap<uint64_t, struct IndexEntry>>();
+        } else if (It->second.MoreEntries->size() >= LOOKUP_KEY_MAX_BUCKET_DEPTH) {
+          return false;
+        }
+        It->second.MoreEntries->insert({GuestFootprint, std::move(NewEntry)});
+      }
+    }
+
+    memcpy(BlobData + GuestCodeOffset, GuestCode.data(), GuestCode.size());
 
     MesaFOZ::foz_payload_key Key = {};
     {
@@ -1040,7 +1174,8 @@ namespace DiskCache {
     memcpy(IndexBlob.data() + sizeof(IndexExtraBlobHeader), ExactGuestCodeExtents.data(), ExactGuestCodeExtents.size() * sizeof(uint32_t));
 
     // hand the rest off to the writer thread
-    Writer->QueueWork(fextl::make_unique<CacheStoreWorkItem>(this, RWCacheDB.get(), Key, LookupKey, std::move(Blob), std::move(IndexBlob)));
+    Writer->QueueWork(
+      fextl::make_unique<CacheStoreWorkItem>(this, RWCacheDB.get(), Key, LookupKey, std::span(BlobData, TotalSize), std::move(IndexBlob)));
     return true;
   }
 

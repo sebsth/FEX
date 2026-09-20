@@ -350,6 +350,7 @@ struct JITPointers {
   uint64_t MonoBackpatcherWrite {};
   uint64_t LUDIV {};
   uint64_t LDIV {};
+  uint64_t RDRANDFallback {};
   uint64_t ThunkCallbackRet {};
 
   // Handles returning/calling ARM64EC code from the JIT, expects the target PC in TMP3
@@ -427,7 +428,7 @@ struct CpuStateFrame {
 
   InternalThreadState* Thread;
 
-#ifdef ARCHITECTURE_arm64ec
+#ifdef _WIN32
   // Set by the kernel on ARM64EC whenever the JIT should cooperatively suspend running guest code.
   uint32_t SuspendDoorbell {};
 #endif

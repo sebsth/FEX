@@ -3249,9 +3249,10 @@ void OpDispatchBuilder::RestoreX87State(Ref MemBase) {
   auto NewFCW = _LoadMemGPR(OpSize::i16Bit, MemBase, OpSize::i16Bit);
   _StoreContextGPR(OpSize::i16Bit, NewFCW, offsetof(FEXCore::Core::CPUState, FCW));
 
+  Ref Top {};
   {
     auto NewFSW = _LoadMemGPR(OpSize::i16Bit, MemBase, Constant(2), OpSize::i16Bit, MemOffsetType::SXTX, 1);
-    ReconstructX87StateFromFSW_Helper(NewFSW);
+    Top = ReconstructX87StateFromFSW_Helper(NewFSW);
   }
 
   {
@@ -3260,10 +3261,21 @@ void OpDispatchBuilder::RestoreX87State(Ref MemBase) {
     _StoreContextGPR(OpSize::i8Bit, NewFTW, offsetof(FEXCore::Core::CPUState, AbridgedFTW));
   }
 
-  for (uint32_t i = 0; i < Core::CPUState::NUM_MMS; i += 2) {
-    auto MMRegs = LoadMemPairFPR(OpSize::i128Bit, MemBase, i * 16 + 32);
-    _StoreContextFPR(OpSize::i128Bit, MMRegs.Low, MMBaseOffset() + i * 16);
-    _StoreContextFPR(OpSize::i128Bit, MMRegs.High, MMBaseOffset() + (i + 1) * 16);
+  auto SevenConst = Constant(7);
+  auto low = Constant(~0ULL);
+  auto high = Constant(0xFFFF);
+  Ref Mask = _VLoadTwoGPRs(low, high);
+  const auto StoreSize = ReducedPrecisionMode ? OpSize::i64Bit : OpSize::i128Bit;
+  for (uint32_t i = 0; i < Core::CPUState::NUM_MMS; ++i) {
+    Ref Reg = _LoadMemFPR(OpSize::i128Bit, MemBase, Constant(16 * i + 32), OpSize::i8Bit, MemOffsetType::SXTX, 1);
+    // Mask off the top bits
+    Reg = _VAnd(OpSize::i128Bit, Reg, Mask);
+    if (ReducedPrecisionMode) {
+      // Convert to double precision
+      Reg = _F80CVT(OpSize::i64Bit, Reg);
+    }
+    _StoreContextFPRIndexed(Reg, Top, StoreSize, MMBaseOffset(), IR::OpSizeToSize(OpSize::i128Bit));
+    Top = _And(OpSize::i32Bit, Add(OpSize::i32Bit, Top, 1), SevenConst);
   }
 }
 
@@ -3757,6 +3769,84 @@ void OpDispatchBuilder::VPMADDUBSWOp(OpcodeArgs) {
   Ref Src2 = LoadSourceFPR(Op, Op->Src[1], Op->Flags);
 
   Ref Result = PMADDUBSWOpImpl(Size, Src1, Src2);
+  StoreResultFPR(Op, Result);
+}
+
+Ref OpDispatchBuilder::VPDPBUSDOpImpl(IR::OpSize Size, Ref Acc, Ref Src1, Ref Src2, bool Saturating) {
+  // Does four 8-bit unsigned * signed byte multiplies per 32-bit element, sums them and accumulates in to the destination
+
+  if (CTX->HostFeatures.SupportsI8MM) {
+    // The I8MM extension maps onto VPDP* almost directly.
+    if (!Saturating) {
+      return _VUSDot(Size, Acc, Src1, Src2);
+    }
+
+    auto DotProduct = _VUSDot(Size, LoadZeroVector(Size), Src1, Src2);
+    return _VSQAdd(Size, OpSize::i32Bit, Acc, DotProduct);
+  }
+
+  if (CTX->HostFeatures.SupportsDotProd) {
+    // VSDOT assumes signed input, so we need to convert Src1 to signed, and then
+    // perform correction afterwards using 0x40 to account for the unsigned input.
+    auto Src1Signed = _VXor(Size, Src1, _VectorImm(Size, OpSize::i8Bit, 0x80));
+    auto SixtyFour = _VectorImm(Size, OpSize::i8Bit, 0x40);
+
+    auto DotProduct = _VSDot(Size, Saturating ? LoadZeroVector(Size) : Acc, Src2, SixtyFour);
+    DotProduct = _VSDot(Size, DotProduct, Src2, SixtyFour);
+    DotProduct = _VSDot(Size, DotProduct, Src1Signed, Src2);
+    if (Saturating) {
+      return _VSQAdd(Size, OpSize::i32Bit, Acc, DotProduct);
+    }
+    return DotProduct;
+  }
+
+  // Naive software implementation.
+  auto Even = _VUnZip(Size, OpSize::i16Bit, Src1, Src2);
+  auto Even1_16b = _VUXTL(Size, OpSize::i8Bit, Even);
+  auto Even2_16b = _VSXTL2(Size, OpSize::i8Bit, Even);
+  auto ResMul_Even = _VMul(Size, OpSize::i16Bit, Even1_16b, Even2_16b);
+
+  auto Odd = _VUnZip2(Size, OpSize::i16Bit, Src1, Src2);
+  auto Odd1_16b = _VUXTL(Size, OpSize::i8Bit, Odd);
+  auto Odd2_16b = _VSXTL2(Size, OpSize::i8Bit, Odd);
+  auto ResMul_Odd = _VMul(Size, OpSize::i16Bit, Odd1_16b, Odd2_16b);
+
+  auto DotProduct = _VSAdALP(Size, OpSize::i16Bit, _VSAddLP(Size, OpSize::i16Bit, ResMul_Even), ResMul_Odd);
+  if (Saturating) {
+    return _VSQAdd(Size, OpSize::i32Bit, Acc, DotProduct);
+  }
+  return _VAdd(Size, OpSize::i32Bit, Acc, DotProduct);
+}
+
+Ref OpDispatchBuilder::VPDPWSSDOpImpl(IR::OpSize Size, Ref Acc, Ref Src1, Ref Src2, bool Saturating) {
+  auto DotProduct = PMADDWDOpImpl(Size, Src1, Src2);
+  if (!Saturating) {
+    return _VAdd(Size, OpSize::i32Bit, Acc, DotProduct);
+  }
+
+  auto NegDotProduct = _VNeg(Size, OpSize::i32Bit, DotProduct);
+  return _VSQSub(Size, OpSize::i32Bit, Acc, NegDotProduct);
+}
+
+void OpDispatchBuilder::VPDPBUSDOp(OpcodeArgs, bool Saturating) {
+  const auto Size = OpSizeFromSrc(Op);
+
+  Ref Acc = LoadSourceFPR(Op, Op->Dest, Op->Flags);
+  Ref Src1 = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
+  Ref Src2 = LoadSourceFPR(Op, Op->Src[1], Op->Flags);
+
+  Ref Result = VPDPBUSDOpImpl(Size, Acc, Src1, Src2, Saturating);
+  StoreResultFPR(Op, Result);
+}
+
+void OpDispatchBuilder::VPDPWSSDOp(OpcodeArgs, bool Saturating) {
+  const auto Size = OpSizeFromSrc(Op);
+
+  Ref Acc = LoadSourceFPR(Op, Op->Dest, Op->Flags);
+  Ref Src1 = LoadSourceFPR(Op, Op->Src[0], Op->Flags);
+  Ref Src2 = LoadSourceFPR(Op, Op->Src[1], Op->Flags);
+
+  Ref Result = VPDPWSSDOpImpl(Size, Acc, Src1, Src2, Saturating);
   StoreResultFPR(Op, Result);
 }
 

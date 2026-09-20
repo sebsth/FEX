@@ -363,7 +363,8 @@ public:
   void MOVVectorUnalignedOp(OpcodeArgs);
   void MOVVectorUnalignedNoNopOp(OpcodeArgs);
   void MOVVectorNTOp(OpcodeArgs, bool IsAVX);
-  void ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::IR::IROps AtomicFetchOp, unsigned SrcIdx);
+  void ALURAXOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp);
+  void ALUOp(OpcodeArgs, FEXCore::IR::IROps ALUIROp, FEXCore::IR::IROps AtomicFetchOp, unsigned SrcIdx, bool DestRAX);
   void LSLOp(OpcodeArgs);
   void INTOp(OpcodeArgs);
   void SyscallOp(OpcodeArgs, bool IsSyscallInst);
@@ -374,8 +375,8 @@ public:
   void IRETOp(OpcodeArgs);
   void CallbackReturnOp(OpcodeArgs);
   void SecondaryALUOp(OpcodeArgs);
-  void ADCOp(OpcodeArgs, uint32_t SrcIndex);
-  void SBBOp(OpcodeArgs, uint32_t SrcIndex);
+  void ADCOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX);
+  void SBBOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX);
   void SALCOp(OpcodeArgs);
   void PUSHOp(OpcodeArgs);
   void PUSHREGOp(OpcodeArgs);
@@ -395,16 +396,18 @@ public:
   void JUMPFARIndirectOp(OpcodeArgs);
   void CALLFARIndirectOp(OpcodeArgs);
   void RETFARIndirectOp(OpcodeArgs);
-  void TESTOp(OpcodeArgs, uint32_t SrcIndex);
+  void TESTOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX);
   void ARPLOp(OpcodeArgs);
   void MOVSXDOp(OpcodeArgs);
   void MOVSXOp(OpcodeArgs);
   void MOVZXOp(OpcodeArgs);
-  void CMPOp(OpcodeArgs, uint32_t SrcIndex);
+  void CMPOp(OpcodeArgs, uint32_t SrcIndex, bool DestRAX);
   void SETccOp(OpcodeArgs);
   void CQOOp(OpcodeArgs);
   void CDQOp(OpcodeArgs);
+  std::optional<Ref> XCHGOpImpl(OpcodeArgs, Ref Src);
   void XCHGOp(OpcodeArgs);
+  void XCHGRAXOp(OpcodeArgs);
   void SAHFOp(OpcodeArgs);
   void LAHFOp(OpcodeArgs);
   void MOVSegOp(OpcodeArgs, bool ToSeg);
@@ -426,11 +429,11 @@ public:
   void RotateOp(OpcodeArgs, bool Left, bool IsImmediate, bool Is1Bit);
   void RCROp1Bit(OpcodeArgs);
   void RCROp8x1Bit(OpcodeArgs);
-  void RCROp(OpcodeArgs);
-  void RCRSmallerOp(OpcodeArgs);
+  void RCROp(OpcodeArgs, bool UseRCX);
+  void RCRSmallerOp(OpcodeArgs, bool UseRCX);
   void RCLOp1Bit(OpcodeArgs);
-  void RCLOp(OpcodeArgs);
-  void RCLSmallerOp(OpcodeArgs);
+  void RCLOp(OpcodeArgs, bool UseRCX);
+  void RCLSmallerOp(OpcodeArgs, bool UseRCX);
 
   void BTOp(OpcodeArgs, uint32_t SrcIndex, enum BTAction Action);
 
@@ -665,6 +668,8 @@ public:
 
   void VPMADDUBSWOp(OpcodeArgs);
   void VPMADDWDOp(OpcodeArgs);
+  void VPDPBUSDOp(OpcodeArgs, bool Saturating);
+  void VPDPWSSDOp(OpcodeArgs, bool Saturating);
 
   void VPMASKMOVOp(OpcodeArgs, bool IsStore);
 
@@ -741,7 +746,7 @@ public:
   void X87FLDCW(OpcodeArgs);
   void X87FNSAVE(OpcodeArgs);
   void X87FNSTENV(OpcodeArgs);
-  void X87FNSTSW(OpcodeArgs);
+  void X87FNSTSW(OpcodeArgs, bool DestRAX);
   void X87FRSTOR(OpcodeArgs);
   void X87FSTCW(OpcodeArgs);
   void X87FXAM(OpcodeArgs);
@@ -1036,6 +1041,9 @@ public:
 
   void AVX128_VPMADDUBSW(OpcodeArgs);
   void AVX128_VPMADDWD(OpcodeArgs);
+  void AVX128_VPDPImpl(OpcodeArgs, std::function<Ref(Ref Acc, Ref Src1, Ref Src2)> Helper);
+  void AVX128_VPDPBUSD(OpcodeArgs, bool Saturating);
+  void AVX128_VPDPWSSD(OpcodeArgs, bool Saturating);
 
   void AVX128_VBLEND(OpcodeArgs, IR::OpSize ElementSize);
 
@@ -1400,6 +1408,10 @@ private:
 
   Ref PMADDUBSWOpImpl(IR::OpSize Size, Ref Src1, Ref Src2);
 
+  Ref VPDPBUSDOpImpl(IR::OpSize Size, Ref Acc, Ref Src1, Ref Src2, bool Saturating);
+
+  Ref VPDPWSSDOpImpl(IR::OpSize Size, Ref Acc, Ref Src1, Ref Src2, bool Saturating);
+
   Ref PMULHRSWOpImpl(OpSize Size, Ref Src1, Ref Src2);
 
   Ref PMULHWOpImpl(OpcodeArgs, bool Signed, Ref Src1, Ref Src2);
@@ -1500,6 +1512,20 @@ private:
   Ref LoadGPRRegister(uint32_t GPR, IR::OpSize Size = OpSize::iInvalid, uint8_t Offset = 0, bool AllowUpperGarbage = false);
   void StoreGPRRegister(uint32_t GPR, const Ref Src, IR::OpSize Size = OpSize::iInvalid, uint8_t Offset = 0);
   void StoreXMMRegister(uint32_t XMM, const Ref Src);
+
+  // Matches semantics around GPR storing that matches `StoreResult_WithOpSize` behaviour.
+  void StoreGPRResultWithZExtSemantics(uint32_t GPR, Ref Src, IR::OpSize OpSize) {
+    const auto GPRSize = GetGPROpSize();
+
+    if (GPRSize == OpSize::i64Bit && OpSize == OpSize::i32Bit) {
+      // If the Source IR op is 64 bits, we need to zext the upper bits
+      // For all other sizes, the upper bits are guaranteed to already be zero
+      Src = GetOpSize(Src) == OpSize::i64Bit ? ARef(Src).Bfe(0, 32).Ref() : Src;
+      StoreGPRRegister(GPR, Src, GPRSize);
+    } else {
+      StoreGPRRegister(GPR, Src, std::min(GPRSize, OpSize));
+    }
+  }
 
   Ref _GetRelocatedPC(const FEXCore::X86Tables::DecodedOp& Op, int64_t Offset, bool Inline) {
     const auto GPRSize = GetGPROpSize();
