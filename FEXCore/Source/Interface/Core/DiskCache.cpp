@@ -276,6 +276,11 @@ namespace DiskCache {
       return false;
     }
 
+    if (MaxSizeReached || CacheFileSize + Blob.size() >= MaxFileSize) {
+      MaxSizeReached = true;
+      return false;
+    }
+
     if (!CacheFOZ.Lock(STORE_LOCK_TIMEOUT_MS) || !IndexFOZ.Lock(STORE_LOCK_TIMEOUT_MS)) {
       CacheFOZ.Unlock();
       IndexFOZ.Unlock();
@@ -362,28 +367,32 @@ namespace DiskCache {
 
     struct __attribute__((packed)) {
       uint16_t FormatVersion;
-      uint8_t Is64BitMode;
       uint64_t HostFeaturesHash;
-    } BucketHeader = {FormatVersion, CTX->Config.Is64BitMode, CTX->HostFeatures.HashForCaching()};
+    } MachineBucketData = {FormatVersion, CTX->HostFeatures.HashForCaching()};
 
-    fextl::vector<uint8_t> BucketBytes;
-    BucketBytes.resize(sizeof(BucketHeader) + SerializedConfig.size());
-    memcpy(BucketBytes.data(), &BucketHeader, sizeof(BucketHeader));
-    memcpy(BucketBytes.data() + sizeof(BucketHeader), SerializedConfig.data(), SerializedConfig.size());
-    BucketHash = XXH3_128bits(BucketBytes.data(), BucketBytes.size());
+    fextl::vector<uint8_t> BucketBytes(sizeof(MachineBucketData) + sizeof(uint8_t) + SerializedConfig.size());
+    memcpy(BucketBytes.data(), &MachineBucketData, sizeof(MachineBucketData));
+    BucketBytes[sizeof(MachineBucketData)] = CTX->Config.Is64BitMode;
+    memcpy(BucketBytes.data() + sizeof(MachineBucketData) + 1, SerializedConfig.data(), SerializedConfig.size());
+
+    uint64_t MachineBucketHash = XXH3_64bits(BucketBytes.data(), sizeof(MachineBucketData));
+    uint64_t ProcessBucketHash = XXH3_64bits(BucketBytes.data() + sizeof(MachineBucketData), 1 + SerializedConfig.size());
+    BucketHash.high64 = MachineBucketHash;
+    BucketHash.low64 = ProcessBucketHash;
 
     fextl::string BasePath = BasePathOverride();
     if (BasePath.empty()) {
       BasePath = FEXCore::Config::GetCacheDirectory() + "DiskCache/";
-      BasePath += fextl::fmt::format("{:016x}{:016x}", BucketHash.high64, BucketHash.low64) + "/";
     }
+    BasePath += fextl::fmt::format("{:016x}", MachineBucketHash) + "/";
     FHU::Filesystem::CreateDirectories(BasePath);
+    // todo could kick off clean up of leftover MachineBucketHash sibling directories here
 
     if (!MapDiskCacheFiles) {
       FileMapper = nullptr;
     }
 
-    fextl::string RWDBBasePath = BasePath + "RWCacheDB";
+    const auto RWDBBasePath = fextl::fmt::format("{}RWCacheDB_{:016x}", BasePath, ProcessBucketHash);
     OpenCacheDB(RWDBBasePath, false);
 
     if (RWCacheDB && !FoundMetadata) {
@@ -619,6 +628,12 @@ namespace DiskCache {
       }
 
       Advance = true;
+
+      // entry not backed by anything right now - todo prune..
+      if (!EntryUnderReview->DB && !BlobRef) {
+        continue;
+      }
+
       // do we have enough room in our live code to even hash GuestSize worth?
       if (Available < EntryUnderReview->GuestSize) {
         continue;
@@ -649,7 +664,7 @@ namespace DiskCache {
           break;
         } else if (Validation) {
           fextl::vector<uint8_t> GuestCode(Entry.GuestSize);
-          if (Entry.Size >= Entry.GuestSize && Entry.DB->ReadCacheBlob(Entry.Offset + Entry.Size - Entry.GuestSize, GuestCode)) {
+          if (Entry.Size >= Entry.GuestSize && Entry.DB && Entry.DB->ReadCacheBlob(Entry.Offset + Entry.Size - Entry.GuestSize, GuestCode)) {
             const uint8_t* CachedGuest = GuestCode.data();
             const uint8_t* LiveGuest = reinterpret_cast<const uint8_t*>(GuestRIP);
             uint64_t DiffCount = 0;
@@ -857,53 +872,55 @@ namespace DiskCache {
     uint64_t LookupKey;
     std::span<uint8_t> Blob;
     fextl::vector<uint8_t> IndexBlob;
+    bool StoreDisk;
     CacheStoreWorkItem(DiskCache* Self, IndexedDB* DB, const MesaFOZ::foz_payload_key& UniqueKey, uint64_t LookupKey,
-                       std::span<uint8_t> Blob, fextl::vector<uint8_t>&& IndexBlob)
+                       std::span<uint8_t> Blob, fextl::vector<uint8_t>&& IndexBlob, bool StoreDisk)
       : Self(Self)
       , DB(DB)
       , UniqueKey(UniqueKey)
       , LookupKey(LookupKey)
       , Blob(Blob)
-      , IndexBlob(std::move(IndexBlob)) {}
+      , IndexBlob(std::move(IndexBlob))
+      , StoreDisk(StoreDisk) {}
     void Run() override {
       struct MesaFOZ::mesa_index_db_file_entry IndexHeader;
-      bool Success = DB->StoreCacheBlob(UniqueKey, LookupKey, Blob, IndexHeader, IndexBlob);
+      bool DiskSuccess = !StoreDisk || DB->StoreCacheBlob(UniqueKey, LookupKey, Blob, IndexHeader, IndexBlob);
 
-      if (Success) {
-        bool KeepEntryInMemory = true;
-        // todo possible other lru condition here like entry size?
-        if (Blob.size() > Self->MemoryLRUMaxSize) {
-          KeepEntryInMemory = false;
-        } else {
-          Self->MemoryLRUCurrentSize += Blob.size();
-        }
+      bool KeepEntryInMemory = true;
+      // todo possible other lru condition here like entry size?
+      if (Blob.size() > Self->MemoryLRUMaxSize) {
+        KeepEntryInMemory = false;
+      } else {
+        Self->MemoryLRUCurrentSize += Blob.size();
+      }
 
-        const IndexExtraBlobHeader* IndexAfterHeader = reinterpret_cast<const IndexExtraBlobHeader*>(IndexBlob.data());
+      const IndexExtraBlobHeader* IndexAfterHeader = reinterpret_cast<const IndexExtraBlobHeader*>(IndexBlob.data());
 
-        fextl::list<MemoryLRUKey>::iterator NewLRUEntry;
-        if (KeepEntryInMemory) {
-          std::lock_guard Guard(Self->MemoryLRULock);
-          Self->MemoryLRU.push_front({LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint, (uint32_t)Blob.size()});
-          NewLRUEntry = Self->MemoryLRU.begin();
-        }
-        {
-          std::lock_guard Guard(Self->IndexLock);
-          auto IndexEntry = Self->LookupLocked(LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint);
-          LOGMAN_THROW_A_FMT(IndexEntry != nullptr, "Stored Index entry not found?");
-          if (IndexEntry) {
+      fextl::list<MemoryLRUKey>::iterator NewLRUEntry;
+      if (KeepEntryInMemory) {
+        std::lock_guard Guard(Self->MemoryLRULock);
+        Self->MemoryLRU.push_front({LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint, (uint32_t)Blob.size()});
+        NewLRUEntry = Self->MemoryLRU.begin();
+      }
+      {
+        std::lock_guard Guard(Self->IndexLock);
+        auto IndexEntry = Self->LookupLocked(LookupKey, IndexAfterHeader->GuestHash, IndexAfterHeader->GuestFootprint);
+        LOGMAN_THROW_A_FMT(IndexEntry != nullptr, "Stored Index entry not found?");
+        if (IndexEntry) {
+          if (StoreDisk && DiskSuccess) {
             IndexEntry->DB = DB;
             IndexEntry->Offset = IndexHeader.cache_db_file_offset;
-            if (!KeepEntryInMemory) {
-              IndexEntry->MemoryBlob.reset();
-            } else {
-              IndexEntry->LRUEntry = NewLRUEntry;
-            }
+          }
+          if (!KeepEntryInMemory) {
+            IndexEntry->MemoryBlob.reset();
+          } else {
+            IndexEntry->LRUEntry = NewLRUEntry;
           }
         }
+      }
 
-        if (KeepEntryInMemory && Self->MemoryLRUCurrentSize > Self->MemoryLRUMaxSize + Self->MemoryLRUEvictThreshold) {
-          Self->Writer->QueueWork(fextl::make_unique<PruneMemoryLRUWorkItem>(Self));
-        }
+      if (KeepEntryInMemory && Self->MemoryLRUCurrentSize > Self->MemoryLRUMaxSize + Self->MemoryLRUEvictThreshold) {
+        Self->Writer->QueueWork(fextl::make_unique<PruneMemoryLRUWorkItem>(Self));
       }
     }
   };
@@ -1173,9 +1190,15 @@ namespace DiskCache {
     memcpy(IndexBlob.data(), &IndexBlobHeader, sizeof(IndexExtraBlobHeader));
     memcpy(IndexBlob.data() + sizeof(IndexExtraBlobHeader), ExactGuestCodeExtents.data(), ExactGuestCodeExtents.size() * sizeof(uint32_t));
 
+    bool StoreDisk = true;
+
+    if (RWCacheDB->Full()) {
+      StoreDisk = false;
+    }
+
     // hand the rest off to the writer thread
-    Writer->QueueWork(
-      fextl::make_unique<CacheStoreWorkItem>(this, RWCacheDB.get(), Key, LookupKey, std::span(BlobData, TotalSize), std::move(IndexBlob)));
+    Writer->QueueWork(fextl::make_unique<CacheStoreWorkItem>(this, RWCacheDB.get(), Key, LookupKey, std::span(BlobData, TotalSize),
+                                                             std::move(IndexBlob), StoreDisk));
     return true;
   }
 
