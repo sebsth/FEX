@@ -14,7 +14,7 @@ namespace FEXCore {
  */
 struct HostFeatures {
   // Changes code generation slightly.
-  enum class HostTypeEnum : uint32_t {
+  enum class HostTypeEnum : uint8_t {
     Unknown,
     Linux,
     Wow64,
@@ -32,16 +32,41 @@ struct HostFeatures {
     return 4 << DCacheLineLog2;
   }
 
+  /**
+   * @brief This structure contains all the data required to determine hashing at the "process" level.
+   * Unlike the `HostFeaturesHash` below, this data changes codegen depending on if the process is Linux, Arm64EC, or Wow64.
+   */
+  struct ProcessFeaturesHash {
+    HostTypeEnum HostType                      : 2 {};
+    uint8_t SupportsFaultFreeSynchronousFaults : 1 {};
+    // This only determines the starting mode a process started in.
+    // The process can technically long jump to-from the other modes.
+    uint8_t Is64BitMode : 1 {};
+    uint8_t pad         : 4 {};
+  };
+  static_assert(sizeof(ProcessFeaturesHash) == 1);
+
+  struct CacheHash {
+    // This hash is used to determine the "bucket" a machine goes in to.
+    // This should match between Linux, Arm64EC, and Wow64.
+    uint64_t HostFeaturesHash;
+
+    // This hash is used to determine features that are different between process types.
+    ProcessFeaturesHash ProcessFeaturesHash;
+  };
+
   [[nodiscard]]
-  uint64_t HashForCaching() const {
-    // As long as the number of options is 64-bit or below, we can just return it.
-    // Skip CPUMIDRs as it doesn't affect codegen.
-    static_assert(offsetof(HostFeatures, CPUMIDRs) == 8);
-    uint64_t Result {};
-    memcpy(&Result, this, sizeof(Result));
+  CacheHash HashForCaching() const {
+    static_assert(offsetof(HostFeatures, ProcessFeatures) == 8);
+
+    CacheHash Result {};
+    memcpy(&Result.HostFeaturesHash, this, sizeof(uint64_t));
+    Result.ProcessFeaturesHash = ProcessFeatures;
+
     return Result;
   }
 
+  // Affects codegen and is basically machine description.
   uint32_t DCacheLineLog2              : 4 {};
   uint32_t SupportsCacheMaintenanceOps : 1 {};
   uint32_t SupportsAES                 : 1 {};
@@ -76,10 +101,13 @@ struct HostFeatures {
   uint32_t PreferZVAForVZero           : 1 {};
   uint32_t SupportsAFP                 : 1 {};
   uint32_t SupportsFloatExceptions     : 1 {};
+  uint32_t SupportsBF16                : 1 {};
   // Flag if this is InstCountCI
   uint32_t IsInstCountCI : 1 {};
-  HostTypeEnum HostType  : 2 {};
-  uint32_t pad           : 24 {};
+  uint32_t pad           : 25 {};
+
+  // This affects codegen, but it isn't machine state
+  ProcessFeaturesHash ProcessFeatures {};
 
   // MIDR information
   // Also used for determining number of CPU cores for CPUID
